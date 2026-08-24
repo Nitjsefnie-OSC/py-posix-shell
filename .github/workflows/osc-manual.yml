@@ -79,9 +79,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH= python - "$GITHUB_WORKSPACE/candidate/pyproject.toml" <<'PY'
+          test_venv="$RUNNER_TEMP/osc-test-venv"
+          PYTHONPATH= python -m venv "$test_venv"
+          "$test_venv/bin/python" -m pip install --disable-pip-version-check --no-input "tomli==2.2.1" "pytest>=8"
+          "$test_venv/bin/python" -c 'import tomli; assert tomli.__version__ == "2.2.1"; print(f"OSC_TEST_TOMLI={tomli.__version__}")'
+          PYTHONPATH= "$test_venv/bin/python" - "$GITHUB_WORKSPACE/candidate/pyproject.toml" <<'PY'
           import sys
-          import tomllib
+          import tomli as tomllib
 
           with open(sys.argv[1], "rb") as stream:
               project = tomllib.load(stream).get("project", {})
@@ -93,9 +97,6 @@ jobs:
               raise SystemExit("candidate dev extra must be exactly the trusted pytest>=8 input")
           print("OSC_TEST_METADATA=source-only dependencies=0 dev=pytest>=8")
           PY
-          test_venv="$RUNNER_TEMP/osc-test-venv"
-          PYTHONPATH= python -m venv "$test_venv"
-          "$test_venv/bin/python" -m pip install --disable-pip-version-check --no-input "pytest>=8"
           test -x "$test_venv/bin/pytest"
           "$test_venv/bin/python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_TEST_PYTEST={module}")'
           echo "TEST_VENV=$test_venv" >> "$GITHUB_ENV"
