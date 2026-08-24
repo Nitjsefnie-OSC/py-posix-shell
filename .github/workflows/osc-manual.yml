@@ -94,7 +94,10 @@ jobs:
               raise SystemExit("candidate dev extra must declare pytest")
           print("OSC_DEV_EXTRA_VALIDATED=pytest")
           PY
-          "$venv_python" -m pip install --disable-pip-version-check --no-input --editable "$GITHUB_WORKSPACE/candidate/.[dev]"
+          install_source="$RUNNER_TEMP/osc-candidate-install-src"
+          mkdir "$install_source"
+          git -C candidate archive --format=tar HEAD | tar -x -C "$install_source"
+          "$venv_python" -m pip install --disable-pip-version-check --no-input --editable "$install_source[dev]"
           test -x "$venv_dir/bin/pytest"
           "$venv_python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_VENV_PYTEST={module}")'
           echo "VENV_DIR=$venv_dir" >> "$GITHUB_ENV"
@@ -109,6 +112,7 @@ jobs:
           [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
           git -C candidate diff --quiet
           git -C candidate diff --cached --quiet
+          [[ -z "$(git -C candidate status --porcelain --untracked-files=all)" ]]
           [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
           [[ -z "$(git -C trusted status --porcelain --untracked-files=all)" ]]
 
@@ -191,6 +195,10 @@ jobs:
             failures=1
           fi
           check_tracked_state candidate
+          if [[ -n "$(git -C candidate status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
+            echo "candidate checkout is not clean" >&2
+            failures=1
+          fi
           if [[ "$(git -C trusted rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_TRUSTED_SHA" ]]; then
             echo "trusted checkout no longer matches workflow SHA" >&2
             failures=1
