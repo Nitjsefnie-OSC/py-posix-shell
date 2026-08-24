@@ -6,11 +6,14 @@ import io
 import os
 import sys
 
+import pytest
+
 import py_posix_shell.posix_utils as posix_utils
 import py_posix_shell.shell as shell_module
 from py_posix_shell import cli
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
+from py_posix_shell.parser import parse
 from py_posix_shell.posix_utils import ProcessInfo, StorageVolume, WindowsViEditor
 from py_posix_shell.shell import LineHistoryState, Shell, terminal_display_width
 
@@ -44,6 +47,28 @@ def test_lexer_preserves_windows_current_directory_backslash():
 
     assert dump_tokens(lex(r".\build_windows.bat")) == [r"word:.\build_windows.bat"]
     assert dump_tokens(lex(r"..\tools\build.cmd")) == [r"word:..\tools\build.cmd"]
+
+
+@pytest.mark.parametrize(
+    ("operator", "continuation"),
+    [
+        ("&&", "\n"),
+        ("&&", "\n\n"),
+        ("&&", " # comment\n"),
+        ("||", "\n"),
+        ("||", "\n\n"),
+        ("||", " # comment\n"),
+        ("|", "\n"),
+        ("|", "\n\n"),
+        ("|", " # comment\n"),
+    ],
+)
+def test_linebreak_after_continuation_operator_matches_inline(operator, continuation):
+    assert parse(f"a {operator} b") == parse(f"a {operator}{continuation}b")
+
+
+def test_unadorned_newline_still_separates_commands():
+    assert len(parse("a\nb").items) == 2
 
 
 def test_assignment_and_parameter_expansion():

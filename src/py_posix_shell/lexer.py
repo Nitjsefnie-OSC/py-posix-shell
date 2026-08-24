@@ -88,8 +88,12 @@ def lex(source: str) -> list[Token]:
             tokens.append(Word(tuple(parts)))
             parts = []
 
-    def last_token_is_separator() -> bool:
-        return bool(tokens and isinstance(tokens[-1], Operator) and tokens[-1].value == ";")
+    def last_token_allows_linebreak() -> bool:
+        return bool(
+            tokens
+            and isinstance(tokens[-1], Operator)
+            and tokens[-1].value in {";", "&&", "||", "|"}
+        )
 
     def current_word_text() -> str:
         return "".join(part.text for part in parts)
@@ -99,7 +103,7 @@ def lex(source: str) -> list[Token]:
 
         if char == "\n":
             flush_word()
-            if not last_token_is_separator():
+            if not last_token_allows_linebreak():
                 tokens.append(Operator(";"))
             i += 1
             continue
