@@ -19,6 +19,8 @@ jobs:
   validate:
     name: Python 3.10
     runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Validate target input
         shell: bash
@@ -73,36 +75,32 @@ jobs:
           : > "$pytest_config"
           echo "PYTEST_CONFIG=$pytest_config" >> "$GITHUB_ENV"
 
-      - name: Install candidate dev extra in isolated venv
+      - name: Create trusted test environment
         shell: bash
         run: |
           set -euo pipefail
-          venv_dir="$RUNNER_TEMP/osc-candidate-venv"
-          python -m venv "$venv_dir"
-          venv_python="$venv_dir/bin/python"
-          "$venv_python" - "$GITHUB_WORKSPACE/candidate/pyproject.toml" <<'PY'
-          import re
+          PYTHONPATH= python - "$GITHUB_WORKSPACE/candidate/pyproject.toml" <<'PY'
           import sys
           import tomllib
 
           with open(sys.argv[1], "rb") as stream:
               project = tomllib.load(stream).get("project", {})
+          dependencies = project.get("dependencies", [])
           dev = project.get("optional-dependencies", {}).get("dev")
-          if not isinstance(dev, list) or not dev:
-              raise SystemExit("candidate project must declare a nonempty dev extra")
-          if not any(re.match(r"(?i)^pytest(?:[<>=!~ ]|$)", str(item).strip()) for item in dev):
-              raise SystemExit("candidate dev extra must declare pytest")
-          print("OSC_DEV_EXTRA_VALIDATED=pytest")
+          if dependencies != []:
+              raise SystemExit("source-only test executor requires no candidate runtime dependencies")
+          if dev != ["pytest>=8"]:
+              raise SystemExit("candidate dev extra must be exactly the trusted pytest>=8 input")
+          print("OSC_TEST_METADATA=source-only dependencies=0 dev=pytest>=8")
           PY
-          install_source="$RUNNER_TEMP/osc-candidate-install-src"
-          mkdir "$install_source"
-          git -C candidate archive --format=tar HEAD | tar -x -C "$install_source"
-          "$venv_python" -m pip install --disable-pip-version-check --no-input --editable "$install_source[dev]"
-          test -x "$venv_dir/bin/pytest"
-          "$venv_python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_VENV_PYTEST={module}")'
-          echo "VENV_DIR=$venv_dir" >> "$GITHUB_ENV"
+          test_venv="$RUNNER_TEMP/osc-test-venv"
+          PYTHONPATH= python -m venv "$test_venv"
+          "$test_venv/bin/python" -m pip install --disable-pip-version-check --no-input "pytest>=8"
+          test -x "$test_venv/bin/pytest"
+          "$test_venv/bin/python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_TEST_PYTEST={module}")'
+          echo "TEST_VENV=$test_venv" >> "$GITHUB_ENV"
 
-      - name: Verify integrity after candidate install
+      - name: Verify integrity before tests
         shell: bash
         env:
           EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
@@ -110,11 +108,9 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
-          git -C candidate diff --quiet
-          git -C candidate diff --cached --quiet
-          [[ -z "$(git -C candidate status --porcelain --untracked-files=all)" ]]
+          [[ -z "$(git -C candidate status --porcelain --untracked-files=all --ignored=matching)" ]]
           [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
-          [[ -z "$(git -C trusted status --porcelain --untracked-files=all)" ]]
+          [[ -z "$(git -C trusted status --porcelain --untracked-files=all --ignored=matching)" ]]
 
       - name: Run trusted baseline against candidate source
         shell: bash
@@ -125,7 +121,7 @@ jobs:
           manifest="$RUNNER_TEMP/trusted-baseline.nodes"
           collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
           set +e
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" --collect-only -q trusted/tests > "$collect_log"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --collect-only -q trusted/tests > "$collect_log"
           collect_status=$?
           set -e
           if (( collect_status != 0 )); then
@@ -141,7 +137,7 @@ jobs:
             exit 1
           fi
           mapfile -t nodes < "$manifest"
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" "${nodes[@]}"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" "${nodes[@]}"
 
       - name: Run candidate tests as additional surface
         shell: bash
@@ -152,7 +148,7 @@ jobs:
           manifest="$RUNNER_TEMP/candidate.nodes"
           collect_log="$RUNNER_TEMP/candidate.collect.log"
           set +e
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" --collect-only -q candidate/tests > "$collect_log"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --collect-only -q candidate/tests > "$collect_log"
           collect_status=$?
           set -e
           if (( collect_status != 0 )); then
@@ -168,7 +164,31 @@ jobs:
             exit 1
           fi
           mapfile -t nodes < "$manifest"
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" "${nodes[@]}"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" "${nodes[@]}"
+
+      - name: Validate candidate packaging in sacrificial venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_source="$RUNNER_TEMP/osc-candidate-install-src"
+          package_venv="$RUNNER_TEMP/osc-package-venv"
+          mkdir "$install_source"
+          git -C candidate archive --format=tar HEAD | tar -x -C "$install_source"
+          PYTHONPATH= python -m venv "$package_venv"
+          "$package_venv/bin/python" -m pip install --disable-pip-version-check --no-input --editable "$install_source[dev]"
+          echo "OSC_PACKAGING_SOURCE=$(git -C candidate rev-parse --verify HEAD)"
+
+      - name: Verify integrity after candidate packaging
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
+          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
+          [[ -z "$(git -C candidate status --porcelain --untracked-files=all --ignored=matching)" ]]
+          [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
+          [[ -z "$(git -C trusted status --porcelain --untracked-files=all --ignored=matching)" ]]
 
       - name: Final integrity evidence
         if: ${{ always() }}
@@ -179,33 +199,23 @@ jobs:
         run: |
           set -u
           failures=0
-          check_tracked_state() {
+          check_checkout() {
             local repo="$1"
-            if ! git -C "$repo" diff --quiet; then
-              echo "tracked unstaged changes in $repo" >&2
+            local expected="$2"
+            local status
+            if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null)" != "$expected" ]]; then
+              echo "$repo HEAD no longer matches provenance" >&2
               failures=1
             fi
-            if ! git -C "$repo" diff --cached --quiet; then
-              echo "tracked staged changes in $repo" >&2
+            if ! status="$(git -C "$repo" status --porcelain --untracked-files=all --ignored=matching 2>/dev/null)"; then
+              echo "cannot inspect $repo checkout" >&2
+              failures=1
+            elif [[ -n "$status" ]]; then
+              echo "$repo checkout is not clean" >&2
+              printf '%s\n' "$status" >&2
               failures=1
             fi
           }
-          if [[ ! "$EXPECTED_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git -C candidate rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_CANDIDATE_SHA" ]]; then
-            echo "candidate HEAD no longer matches provenance" >&2
-            failures=1
-          fi
-          check_tracked_state candidate
-          if [[ -n "$(git -C candidate status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
-            echo "candidate checkout is not clean" >&2
-            failures=1
-          fi
-          if [[ "$(git -C trusted rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_TRUSTED_SHA" ]]; then
-            echo "trusted checkout no longer matches workflow SHA" >&2
-            failures=1
-          fi
-          check_tracked_state trusted
-          if [[ -n "$(git -C trusted status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
-            echo "trusted checkout is not clean" >&2
-            failures=1
-          fi
+          check_checkout candidate "$EXPECTED_CANDIDATE_SHA"
+          check_checkout trusted "$EXPECTED_TRUSTED_SHA"
           exit "$failures"
