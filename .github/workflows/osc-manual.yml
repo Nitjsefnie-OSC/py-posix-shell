@@ -17,41 +17,187 @@ concurrency:
 
 jobs:
   validate:
-    name: Python ${{ matrix.python-version }}
+    name: Python 3.10
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-          - "3.10"
     steps:
-      - name: Check out requested ref
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.target_ref }}
-          fetch-depth: 0
-
-      - name: Resolve target provenance
+      - name: Validate target input
         shell: bash
+        env:
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
         run: |
-          target_sha="$(git rev-parse --verify HEAD)"
-          if [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Resolved target is not a 40-character SHA: $target_sha" >&2
+          set -euo pipefail
+          if [[ -z "${TARGET_REF_INPUT//[[:space:]]/}" ]]; then
+            echo "target_ref must contain non-whitespace characters" >&2
             exit 1
           fi
-          echo "OSC_TARGET_SHA=$target_sha"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Check out trusted workflow state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: ${{ matrix.python-version }}
+          ref: ${{ github.sha }}
+          path: trusted
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install package and dev dependencies
+      - name: Check out requested ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.target_ref }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve candidate provenance
+        id: provenance
         shell: bash
         run: |
-          python -m pip install --disable-pip-version-check --no-input --editable ".[dev]"
+          set -euo pipefail
+          candidate_sha="$(git -C candidate rev-parse --verify HEAD)"
+          if [[ ! "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate HEAD is not a 40-character lowercase SHA" >&2
+            exit 1
+          fi
+          echo "OSC_TARGET_SHA=$candidate_sha"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Run established validation
+      - name: Set up Python 3.10
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.10"
+
+      - name: Create wrapper-owned pytest config
         shell: bash
         run: |
-          python -m pytest
+          set -euo pipefail
+          pytest_config="$RUNNER_TEMP/osc-empty-pytest.ini"
+          : > "$pytest_config"
+          echo "PYTEST_CONFIG=$pytest_config" >> "$GITHUB_ENV"
+
+      - name: Install candidate dev extra in isolated venv
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv_dir="$RUNNER_TEMP/osc-candidate-venv"
+          python -m venv "$venv_dir"
+          venv_python="$venv_dir/bin/python"
+          "$venv_python" - "$GITHUB_WORKSPACE/candidate/pyproject.toml" <<'PY'
+          import re
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as stream:
+              project = tomllib.load(stream).get("project", {})
+          dev = project.get("optional-dependencies", {}).get("dev")
+          if not isinstance(dev, list) or not dev:
+              raise SystemExit("candidate project must declare a nonempty dev extra")
+          if not any(re.match(r"(?i)^pytest(?:[<>=!~ ]|$)", str(item).strip()) for item in dev):
+              raise SystemExit("candidate dev extra must declare pytest")
+          print("OSC_DEV_EXTRA_VALIDATED=pytest")
+          PY
+          "$venv_python" -m pip install --disable-pip-version-check --no-input --editable "$GITHUB_WORKSPACE/candidate/.[dev]"
+          test -x "$venv_dir/bin/pytest"
+          "$venv_python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_VENV_PYTEST={module}")'
+          echo "VENV_DIR=$venv_dir" >> "$GITHUB_ENV"
+
+      - name: Verify integrity after candidate install
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
+          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
+          git -C candidate diff --quiet
+          git -C candidate diff --cached --quiet
+          [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
+          [[ -z "$(git -C trusted status --porcelain --untracked-files=all)" ]]
+
+      - name: Run trusted baseline against candidate source
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/candidate/src
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/trusted-baseline.nodes"
+          collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
+          set +e
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" --collect-only -q trusted/tests > "$collect_log"
+          collect_status=$?
+          set -e
+          if (( collect_status != 0 )); then
+            cat "$collect_log"
+            exit "$collect_status"
+          fi
+          awk '/::/ { print }' "$collect_log" | sort -u > "$manifest"
+          count="$(wc -l < "$manifest")"
+          digest="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          echo "OSC_CENSUS=trusted-baseline count=$count sha256=$digest"
+          if (( count <= 0 )); then
+            echo "trusted baseline collection is empty" >&2
+            exit 1
+          fi
+          mapfile -t nodes < "$manifest"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" "${nodes[@]}"
+
+      - name: Run candidate tests as additional surface
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/candidate/src
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/candidate.nodes"
+          collect_log="$RUNNER_TEMP/candidate.collect.log"
+          set +e
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" --collect-only -q candidate/tests > "$collect_log"
+          collect_status=$?
+          set -e
+          if (( collect_status != 0 )); then
+            cat "$collect_log"
+            exit "$collect_status"
+          fi
+          awk '/::/ { print }' "$collect_log" | sort -u > "$manifest"
+          count="$(wc -l < "$manifest")"
+          digest="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          echo "OSC_CENSUS=candidate count=$count sha256=$digest"
+          if (( count <= 0 )); then
+            echo "candidate collection is empty" >&2
+            exit 1
+          fi
+          mapfile -t nodes < "$manifest"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$VENV_DIR/bin/python" -m pytest -c "$PYTEST_CONFIG" "${nodes[@]}"
+
+      - name: Final integrity evidence
+        if: ${{ always() }}
+        env:
+          EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
+          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -u
+          failures=0
+          check_tracked_state() {
+            local repo="$1"
+            if ! git -C "$repo" diff --quiet; then
+              echo "tracked unstaged changes in $repo" >&2
+              failures=1
+            fi
+            if ! git -C "$repo" diff --cached --quiet; then
+              echo "tracked staged changes in $repo" >&2
+              failures=1
+            fi
+          }
+          if [[ ! "$EXPECTED_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git -C candidate rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_CANDIDATE_SHA" ]]; then
+            echo "candidate HEAD no longer matches provenance" >&2
+            failures=1
+          fi
+          check_tracked_state candidate
+          if [[ "$(git -C trusted rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_TRUSTED_SHA" ]]; then
+            echo "trusted checkout no longer matches workflow SHA" >&2
+            failures=1
+          fi
+          check_tracked_state trusted
+          if [[ -n "$(git -C trusted status --porcelain --untracked-files=all 2>/dev/null)" ]]; then
+            echo "trusted checkout is not clean" >&2
+            failures=1
+          fi
+          exit "$failures"
