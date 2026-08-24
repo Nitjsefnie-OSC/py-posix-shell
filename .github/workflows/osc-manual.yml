@@ -119,10 +119,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/candidate/src
         run: |
           set -euo pipefail
+          test_root="$GITHUB_WORKSPACE/trusted/tests"
           manifest="$RUNNER_TEMP/trusted-baseline.nodes"
           collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
           set +e
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --collect-only -q trusted/tests > "$collect_log"
+          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. --collect-only -q . ) > "$collect_log"
           collect_status=$?
           set -e
           if (( collect_status != 0 )); then
@@ -138,7 +139,7 @@ jobs:
             exit 1
           fi
           mapfile -t nodes < "$manifest"
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" "${nodes[@]}"
+          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. "${nodes[@]}" )
 
       - name: Run candidate tests as additional surface
         shell: bash
@@ -146,10 +147,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/candidate/src
         run: |
           set -euo pipefail
+          test_root="$GITHUB_WORKSPACE/candidate/tests"
           manifest="$RUNNER_TEMP/candidate.nodes"
           collect_log="$RUNNER_TEMP/candidate.collect.log"
           set +e
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --collect-only -q candidate/tests > "$collect_log"
+          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. --collect-only -q . ) > "$collect_log"
           collect_status=$?
           set -e
           if (( collect_status != 0 )); then
@@ -165,7 +167,7 @@ jobs:
             exit 1
           fi
           mapfile -t nodes < "$manifest"
-          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" "${nodes[@]}"
+          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. "${nodes[@]}" )
 
       - name: Validate candidate packaging in sacrificial venv
         shell: bash
