@@ -12,7 +12,7 @@ import py_posix_shell.posix_utils as posix_utils
 import py_posix_shell.shell as shell_module
 from py_posix_shell import cli
 from py_posix_shell.lexer import dump_tokens, lex
-from py_posix_shell.errors import ShellExit
+from py_posix_shell.errors import ParseError, ShellExit
 from py_posix_shell.parser import parse
 from py_posix_shell.posix_utils import ProcessInfo, StorageVolume, WindowsViEditor
 from py_posix_shell.shell import LineHistoryState, Shell, terminal_display_width
@@ -64,7 +64,13 @@ def test_lexer_preserves_windows_current_directory_backslash():
     ],
 )
 def test_linebreak_after_continuation_operator_matches_inline(operator, continuation):
-    assert parse(f"a {operator} b") == parse(f"a {operator}{continuation}b")
+    def parse_outcome(source):
+        try:
+            return ("success", parse(source))
+        except ParseError as error:
+            return ("error", type(error).__name__, str(error))
+
+    assert parse_outcome(f"a {operator} b") == parse_outcome(f"a {operator}{continuation}b")
 
 
 def test_unadorned_newline_still_separates_commands():
