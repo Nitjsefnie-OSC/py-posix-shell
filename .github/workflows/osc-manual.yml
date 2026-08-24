@@ -1,0 +1,57 @@
+name: OSC Manual Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Git ref or SHA to validate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osc-manual-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Resolve target provenance
+        shell: bash
+        run: |
+          target_sha="$(git rev-parse --verify HEAD)"
+          if [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Resolved target is not a 40-character SHA: $target_sha" >&2
+            exit 1
+          fi
+          echo "OSC_TARGET_SHA=$target_sha"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --editable ".[dev]"
+
+      - name: Run established validation
+        shell: bash
+        run: |
+          python -m pytest
