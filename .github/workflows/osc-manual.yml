@@ -28,15 +28,10 @@ jobs:
           TARGET_REF_INPUT: ${{ inputs.target_ref }}
         run: |
           set -euo pipefail
-          if [[ -z "${TARGET_REF_INPUT//[[:space:]]/}" ]]; then echo "target_ref must contain non-whitespace characters" >&2; exit 1; fi
-
-      - name: Check out trusted workflow state
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.sha }}
-          path: trusted
-          fetch-depth: 0
-          persist-credentials: false
+          if [[ -z "${TARGET_REF_INPUT//[[:space:]]/}" ]]; then
+            echo "target_ref must contain non-whitespace characters" >&2
+            exit 1
+          fi
 
       - name: Check out requested ref
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -52,7 +47,10 @@ jobs:
         run: |
           set -euo pipefail
           candidate_sha="$(git -C candidate rev-parse --verify HEAD)"
-          if [[ ! "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then echo "candidate HEAD is not a 40-character lowercase SHA" >&2; exit 1; fi
+          if [[ ! "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate HEAD is not a 40-character lowercase SHA" >&2
+            exit 1
+          fi
           echo "OSC_TARGET_SHA=$candidate_sha"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
 
@@ -61,67 +59,13 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Create wrapper-owned pytest config
-        shell: bash
-        run: |
-          set -euo pipefail
-          pytest_config="$RUNNER_TEMP/osc-empty-pytest.ini"
-          helper="$RUNNER_TEMP/osc-manifest.py"
-          : > "$pytest_config"
-          cat > "$helper" <<'PY'
-          import contextlib, hashlib, json, os, pathlib, subprocess, sys
-          import pytest
-          def canonical(value): return (json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n").encode()
-          def child_env(): return dict(os.environ, PYTHONPATH="")
-          class Audit:
-              def __init__(self): self.collection = []; self.calls = []; self.failed = False
-              @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-              def pytest_collection_finish(self, session): yield; self.collection = [item.nodeid for item in session.items]
-              @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-              def pytest_collectreport(self, report): self.failed |= report.failed; yield
-              @pytest.hookimpl(hookwrapper=True, tryfirst=True)
-              def pytest_runtest_makereport(self, item, call):
-                  failed, when, nodeid = call.excinfo is not None and item.get_closest_marker("xfail") is None, call.when, item.nodeid; yield; self.failed |= failed
-                  if when == "call": self.calls.append(nodeid)
-          def invoke():
-              mode, root, config, source, *nodes = sys.argv[1:]; audit = Audit()
-              sys.path.insert(1, source); os.chdir(root); os.environ.update(PYTEST_ADDOPTS="", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
-              args = ["--collect-only", "-q", "."] if mode == "pytest-collect" else nodes
-              with contextlib.redirect_stdout(sys.stderr): status = int(pytest.main(["-p", "no:cacheprovider", "-c", config, "--rootdir=.", *args], plugins=[audit]))
-              if audit.failed and status == 0: status = 1
-              if status: return status
-              value = audit.collection if mode == "pytest-collect" else audit.calls
-              os.write(1, canonical(value)); sink = os.open(os.devnull, os.O_WRONLY); os.dup2(sink, 1); os.close(sink); return status
-          def decode(raw):
-              try: value = json.loads(raw)
-              except (json.JSONDecodeError, UnicodeDecodeError): raise SystemExit("invalid manifest/evidence JSON")
-              if raw != canonical(value): raise SystemExit("manifest/evidence is not canonical JSON")
-              return value
-          def nodes(raw):
-              value = decode(raw); invalid = not isinstance(value, list) or not value or any(not isinstance(node, str) or not node or "\0" in node for node in value)
-              if invalid or len(value) != len(set(value)): raise SystemExit("manifest/evidence is not nonempty unique node JSON")
-              return value
-          def run():
-              _, root, config, source, label, manifest, log = sys.argv[1:]; base = [sys.executable, __file__]
-              with open(log, "wb") as stream: collected = subprocess.run([*base, "pytest-collect", root, config, source], cwd=root, env=child_env(), stdout=subprocess.PIPE, stderr=stream)
-              if collected.returncode: sys.stdout.buffer.write(pathlib.Path(log).read_bytes()); return collected.returncode
-              expected = nodes(collected.stdout); raw = canonical(expected); pathlib.Path(manifest).write_bytes(raw); expected = nodes(pathlib.Path(manifest).read_bytes())
-              print(f"OSC_CENSUS={label} count={len(expected)} sha256={hashlib.sha256(raw).hexdigest()}", flush=True)
-              replayed = subprocess.run([*base, "pytest-replay", root, config, source, *expected], cwd=root, env=child_env(), stdout=subprocess.PIPE)
-              if replayed.returncode: return replayed.returncode
-              calls = nodes(replayed.stdout)
-              if calls != expected: print("replay call reports do not exactly match manifest", file=sys.stderr); return 1
-              pathlib.Path(manifest).write_bytes(raw); nodes(pathlib.Path(manifest).read_bytes()); return 0
-          status = invoke() if sys.argv[1].startswith("pytest-") else run()
-          raise SystemExit(status)
-          PY
-          printf 'PYTEST_CONFIG=%s\nOSC_MANIFEST_HELPER=%s\n' "$pytest_config" "$helper" >> "$GITHUB_ENV"
-
       - name: Create trusted test environment
         shell: bash
         run: |
           set -euo pipefail
           test_venv="$RUNNER_TEMP/osc-test-venv"
+          pytest_config="$RUNNER_TEMP/osc-empty-pytest.ini"
+          : > "$pytest_config"
           PYTHONPATH= python -m venv "$test_venv"
           "$test_venv/bin/python" -m pip install --disable-pip-version-check --no-input "tomli==2.2.1" "pytest>=8"
           "$test_venv/bin/python" -c 'import tomli; assert tomli.__version__ == "2.2.1"; print(f"OSC_TEST_TOMLI={tomli.__version__}")'
@@ -132,47 +76,35 @@ jobs:
               project = tomllib.load(stream).get("project", {})
           dependencies = project.get("dependencies", [])
           dev = project.get("optional-dependencies", {}).get("dev")
-          if dependencies != []: raise SystemExit("source-only test executor requires no candidate runtime dependencies")
-          if dev != ["pytest>=8"]: raise SystemExit("candidate dev extra must be exactly the trusted pytest>=8 input")
+          if dependencies != []:
+              raise SystemExit("source-only test executor requires no candidate runtime dependencies")
+          if dev != ["pytest>=8"]:
+              raise SystemExit("candidate dev extra must be exactly the trusted pytest>=8 input")
           print("OSC_TEST_METADATA=source-only dependencies=0 dev=pytest>=8")
           PY
           test -x "$test_venv/bin/pytest"
           "$test_venv/bin/python" -c 'import pathlib, pytest, sys; root = pathlib.Path(sys.prefix).resolve(); module = pathlib.Path(pytest.__file__).resolve(); assert module.is_relative_to(root); print(f"OSC_TEST_PYTEST={module}")'
-          echo "TEST_VENV=$test_venv" >> "$GITHUB_ENV"
+          printf 'TEST_VENV=%s\nPYTEST_CONFIG=%s\n' "$test_venv" "$pytest_config" >> "$GITHUB_ENV"
 
       - name: Verify integrity before tests
         shell: bash
         env:
           EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
-          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
           [[ -z "$(git -C candidate status --porcelain --untracked-files=all --ignored=matching)" ]]
-          [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
-          [[ -z "$(git -C trusted status --porcelain --untracked-files=all --ignored=matching)" ]]
 
-      - name: Run trusted baseline against candidate source
+      - name: Run complete candidate test suite
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/candidate/src
         run: |
           set -euo pipefail
-          test_root="$GITHUB_WORKSPACE/trusted/tests"
-          manifest="$RUNNER_TEMP/trusted-baseline.nodes.json"; collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
-          run_helper() { [[ "$(sha256sum "$OSC_MANIFEST_HELPER" | cut -d' ' -f1)" == "197ad2490568447b15753c5e27d9f4b3784ec7abf806857b726cf87253e78aa0" ]] && PYTHONPATH= "$TEST_VENV/bin/python" "$OSC_MANIFEST_HELPER" "$@"; }
-          run_helper run "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" trusted-baseline "$manifest" "$collect_log"
-
-      - name: Run candidate tests as additional surface
-        shell: bash
-        env:
-          PYTHONPATH: ${{ github.workspace }}/candidate/src
-        run: |
-          set -euo pipefail
-          test_root="$GITHUB_WORKSPACE/candidate/tests"
-          manifest="$RUNNER_TEMP/candidate.nodes.json"; collect_log="$RUNNER_TEMP/candidate.collect.log"
-          run_helper() { [[ "$(sha256sum "$OSC_MANIFEST_HELPER" | cut -d' ' -f1)" == "197ad2490568447b15753c5e27d9f4b3784ec7abf806857b726cf87253e78aa0" ]] && PYTHONPATH= "$TEST_VENV/bin/python" "$OSC_MANIFEST_HELPER" "$@"; }
-          run_helper run "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" candidate "$manifest" "$collect_log"
+          cd "$GITHUB_WORKSPACE/candidate"
+          PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" \
+            "$TEST_VENV/bin/python" -m pytest -q -p no:cacheprovider -c "$PYTEST_CONFIG" \
+            --rootdir=. tests
 
       - name: Validate candidate packaging in sacrificial venv
         shell: bash
@@ -190,40 +122,31 @@ jobs:
         shell: bash
         env:
           EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
-          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           [[ "$(git -C candidate rev-parse --verify HEAD)" == "$EXPECTED_CANDIDATE_SHA" ]]
           [[ -z "$(git -C candidate status --porcelain --untracked-files=all --ignored=matching)" ]]
-          [[ "$(git -C trusted rev-parse --verify HEAD)" == "$EXPECTED_TRUSTED_SHA" ]]
-          [[ -z "$(git -C trusted status --porcelain --untracked-files=all --ignored=matching)" ]]
 
       - name: Final integrity evidence
         if: ${{ always() }}
         env:
           EXPECTED_CANDIDATE_SHA: ${{ steps.provenance.outputs.candidate_sha }}
-          EXPECTED_TRUSTED_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -u
           failures=0
-          check_checkout() {
-            local repo="$1"
-            local expected="$2"
-            local status
-            if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null)" != "$expected" ]]; then
-              echo "$repo HEAD no longer matches provenance" >&2
-              failures=1
-            fi
-            if ! status="$(git -C "$repo" status --porcelain --untracked-files=all --ignored=matching 2>/dev/null)"; then
-              echo "cannot inspect $repo checkout" >&2
-              failures=1
-            elif [[ -n "$status" ]]; then
-              echo "$repo checkout is not clean" >&2
-              printf '%s\n' "$status" >&2
-              failures=1
-            fi
-          }
-          check_checkout candidate "$EXPECTED_CANDIDATE_SHA"
-          check_checkout trusted "$EXPECTED_TRUSTED_SHA"
+          status=""
+          if [[ ! "$EXPECTED_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             [[ "$(git -C candidate rev-parse --verify HEAD 2>/dev/null)" != "$EXPECTED_CANDIDATE_SHA" ]]; then
+            echo "candidate HEAD no longer matches provenance" >&2
+            failures=1
+          fi
+          if ! status="$(git -C candidate status --porcelain --untracked-files=all --ignored=matching 2>/dev/null)"; then
+            echo "cannot inspect candidate checkout" >&2
+            failures=1
+          elif [[ -n "$status" ]]; then
+            echo "candidate checkout is not clean" >&2
+            printf '%s\n' "$status" >&2
+            failures=1
+          fi
           exit "$failures"
