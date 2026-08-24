@@ -72,8 +72,46 @@ jobs:
         run: |
           set -euo pipefail
           pytest_config="$RUNNER_TEMP/osc-empty-pytest.ini"
+          helper="$RUNNER_TEMP/osc-manifest.py"
           : > "$pytest_config"
-          echo "PYTEST_CONFIG=$pytest_config" >> "$GITHUB_ENV"
+          cat > "$helper" <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          import pytest
+          MANIFEST = None
+          def canonical(nodes): return (json.dumps(nodes, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+          def pytest_collection_finish(session): pathlib.Path(MANIFEST).write_bytes(canonical([item.nodeid for item in session.items]))
+          def invoke_pytest(root, config, source, args, collect=False):
+              sys.path.insert(1, source); os.chdir(root)
+              os.environ.update(PYTEST_ADDOPTS="", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"); plugins = [sys.modules[__name__]] if collect else []
+              return int(pytest.main(["-p", "no:cacheprovider", "-c", config, "--rootdir=.", *args], plugins=plugins))
+          def child_env(): return dict(os.environ, PYTHONPATH="")
+          def collect():
+              root, config, source, manifest, log = sys.argv[2:]; pathlib.Path(manifest).unlink(missing_ok=True)
+              command = [sys.executable, __file__, "pytest-collect", root, config, source, manifest]
+              with open(log, "wb") as stream:
+                  status = subprocess.run(command, cwd=root, env=child_env(), stdout=stream, stderr=subprocess.STDOUT).returncode
+              if status: sys.stdout.buffer.write(pathlib.Path(log).read_bytes())
+              return status
+          def replay():
+              root, config, source, label, manifest = sys.argv[2:]
+              raw = pathlib.Path(manifest).read_bytes()
+              try: nodes = json.loads(raw)
+              except (json.JSONDecodeError, UnicodeDecodeError): raise SystemExit("invalid manifest JSON")
+              invalid = not isinstance(nodes, list) or not nodes or any(not isinstance(node, str) or not node or "\0" in node for node in nodes)
+              if invalid or len(nodes) != len(set(nodes)) or raw != canonical(nodes): raise SystemExit("manifest is not canonical nonempty unique node JSON")
+              print(f"OSC_CENSUS={label} count={len(nodes)} sha256={hashlib.sha256(raw).hexdigest()}", flush=True)
+              command = [sys.executable, __file__, "pytest-replay", root, config, source, *nodes]; return subprocess.run(command, cwd=root, env=child_env()).returncode
+          mode = sys.argv[1]
+          if mode == "pytest-collect":
+              MANIFEST = sys.argv[5]
+              status = invoke_pytest(*sys.argv[2:5], ["--collect-only", "-q", "."], collect=True)
+          elif mode == "pytest-replay": status = invoke_pytest(*sys.argv[2:5], sys.argv[5:])
+          elif mode == "collect": status = collect()
+          elif mode == "replay": status = replay()
+          else: raise SystemExit("unknown manifest helper mode")
+          raise SystemExit(status)
+          PY
+          printf 'PYTEST_CONFIG=%s\nOSC_MANIFEST_HELPER=%s\n' "$pytest_config" "$helper" >> "$GITHUB_ENV"
 
       - name: Create trusted test environment
         shell: bash
@@ -120,26 +158,10 @@ jobs:
         run: |
           set -euo pipefail
           test_root="$GITHUB_WORKSPACE/trusted/tests"
-          manifest="$RUNNER_TEMP/trusted-baseline.nodes"
-          collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
-          set +e
-          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. --collect-only -q . ) > "$collect_log"
-          collect_status=$?
-          set -e
-          if (( collect_status != 0 )); then
-            cat "$collect_log"
-            exit "$collect_status"
-          fi
-          awk '/::/ { print }' "$collect_log" | sort -u > "$manifest"
-          count="$(wc -l < "$manifest")"
-          digest="$(sha256sum "$manifest" | cut -d' ' -f1)"
-          echo "OSC_CENSUS=trusted-baseline count=$count sha256=$digest"
-          if (( count <= 0 )); then
-            echo "trusted baseline collection is empty" >&2
-            exit 1
-          fi
-          mapfile -t nodes < "$manifest"
-          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. "${nodes[@]}" )
+          manifest="$RUNNER_TEMP/trusted-baseline.nodes.json"; collect_log="$RUNNER_TEMP/trusted-baseline.collect.log"
+          run_helper() { [[ "$(sha256sum "$OSC_MANIFEST_HELPER" | cut -d' ' -f1)" == "b8e2e5e323829a4b3e84663e96259247bc7b211bc32f53e8a164405ddd9b337a" ]] && PYTHONPATH= "$TEST_VENV/bin/python" "$OSC_MANIFEST_HELPER" "$@"; }
+          run_helper collect "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" "$manifest" "$collect_log"
+          run_helper replay "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" trusted-baseline "$manifest"
 
       - name: Run candidate tests as additional surface
         shell: bash
@@ -148,26 +170,10 @@ jobs:
         run: |
           set -euo pipefail
           test_root="$GITHUB_WORKSPACE/candidate/tests"
-          manifest="$RUNNER_TEMP/candidate.nodes"
-          collect_log="$RUNNER_TEMP/candidate.collect.log"
-          set +e
-          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. --collect-only -q . ) > "$collect_log"
-          collect_status=$?
-          set -e
-          if (( collect_status != 0 )); then
-            cat "$collect_log"
-            exit "$collect_status"
-          fi
-          awk '/::/ { print }' "$collect_log" | sort -u > "$manifest"
-          count="$(wc -l < "$manifest")"
-          digest="$(sha256sum "$manifest" | cut -d' ' -f1)"
-          echo "OSC_CENSUS=candidate count=$count sha256=$digest"
-          if (( count <= 0 )); then
-            echo "candidate collection is empty" >&2
-            exit 1
-          fi
-          mapfile -t nodes < "$manifest"
-          ( cd "$test_root" && PYTEST_ADDOPTS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PYTHONPATH" "$TEST_VENV/bin/python" -m pytest -p no:cacheprovider -c "$PYTEST_CONFIG" --rootdir=. "${nodes[@]}" )
+          manifest="$RUNNER_TEMP/candidate.nodes.json"; collect_log="$RUNNER_TEMP/candidate.collect.log"
+          run_helper() { [[ "$(sha256sum "$OSC_MANIFEST_HELPER" | cut -d' ' -f1)" == "b8e2e5e323829a4b3e84663e96259247bc7b211bc32f53e8a164405ddd9b337a" ]] && PYTHONPATH= "$TEST_VENV/bin/python" "$OSC_MANIFEST_HELPER" "$@"; }
+          run_helper collect "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" "$manifest" "$collect_log"
+          run_helper replay "$test_root" "$PYTEST_CONFIG" "$PYTHONPATH" candidate "$manifest"
 
       - name: Validate candidate packaging in sacrificial venv
         shell: bash
